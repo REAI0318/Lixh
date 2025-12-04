@@ -64,6 +64,45 @@ def to_one_hot(tensor,nClasses):
     return one_hot
 
 
+# =========================================================================
+# SCE Loss (Symmetric Cross Entropy) - 替代MAE
+# =========================================================================
+class SCELoss(torch.nn.Module):
+    """
+    Symmetric Cross Entropy Loss for robust and strong gradient
+    Loss = alpha * CE + beta * RCE
+    
+    优势:
+    1. CE提供强梯度（误差越大，梯度越大）
+    2. RCE提供抗噪能力
+    3. 与Sharpening完美配合
+    
+    Reference: "Symmetric Cross Entropy for Robust Learning" (ICCV 2019)
+    """
+    def __init__(self, alpha=1.0, beta=0.5, num_classes=40):
+        super(SCELoss, self).__init__()
+        self.device = 'cuda'
+        self.alpha = alpha  # CE权重
+        self.beta = beta    # RCE权重
+        self.num_classes = num_classes
+        self.cross_entropy = torch.nn.CrossEntropyLoss()
+    
+    def forward(self, pred, labels):
+        # CE (standard cross entropy - 强梯度)
+        ce = self.cross_entropy(pred, labels)
+        
+        # RCE (reverse cross entropy - 抗噪)
+        pred = torch.softmax(pred, dim=1)
+        pred = torch.clamp(pred, min=1e-7, max=1.0)
+        label_one_hot = torch.nn.functional.one_hot(labels, self.num_classes).float().to(self.device)
+        label_one_hot = torch.clamp(label_one_hot, min=1e-4, max=1.0)
+        rce = (-1 * torch.sum(pred * torch.log(label_one_hot), dim=1))
+        
+        # Combined loss
+        loss = self.alpha * ce + self.beta * rce.mean()
+        return loss
+
+
 def topk_ce_FPL(pred, inputs_2, temp_k=3, threshold=0.90, weight='concave',gamma=0.2):
     soft_plus = torch.nn.Softplus()
     prob_topk, pse_topk = torch.topk(inputs_2.float().softmax(dim=1).detach(), k=temp_k + 1, dim=1)
@@ -135,14 +174,16 @@ def training(args):
     semi_pt_net = semi_pt_net.to('cuda')
     
 
-    crc_criterion = MeanAbsoluteError(num_classes=args.num_classes)
+    # 使用SCE Loss替代MAE - 提供强梯度，与Sharpening配合冲击80%
+    crc_criterion = SCELoss(alpha=1.0, beta=0.5, num_classes=args.num_classes)
     align_criterion = MGLoss(temperature=0.07)
     global_align_criterion = SupConLoss()
     unsup_criterion = nn.CrossEntropyLoss(reduction='mean')
+    print("[INFO] Using SCE Loss (alpha=1.0, beta=0.5) for supervised learning - targeting 80%!")
     
     # KL散度Loss，用于Teacher-Student软标签对齐
     kl_loss_func = nn.KLDivLoss(reduction='batchmean')
-    print("[INFO] Using KL Divergence Loss for soft label alignment (weight=0.5)")
+    print("[INFO] Using KL Divergence Loss for soft label alignment (weight=1.0)")
 
     optimizer_img = optim.Adam(semi_img_net.parameters(), lr=args.lr_img, weight_decay=args.weight_decay)
     optimizer_pt = optim.Adam(semi_pt_net.parameters(), lr=args.lr_pt, weight_decay=args.weight_decay)
@@ -486,7 +527,7 @@ def training(args):
             align_loss= args.weight_align * mg_loss
 
             #total loss (v1.2 + KL)
-            loss = crc_loss + align_loss + cps_loss + quan_loss + (0.5 * loss_kl)
+            loss = crc_loss + align_loss + cps_loss + quan_loss + (1.0 * loss_kl)
             
             # === Low Confidence Correction Loss (新增部分) ===
             if args.use_low_confidence_correction:
@@ -702,8 +743,8 @@ def eval_func(img_pairs):
     pt_feat = np.load(args.save + '/pt_feat.npy')
     label = np.load(args.save + '/label.npy')
     ########################################
-    img_test = normalize(img_feat, norm='l1', axis=1)
-    pt_test = normalize(pt_feat, norm='l1', axis=1)
+    img_test = normalize(img_feat, norm='l2', axis=1)
+    pt_test = normalize(pt_feat, norm='l2', axis=1)
     ########################################
     par_list = [
         (img_test, pt_test, 'Image2Pt'),
@@ -732,7 +773,7 @@ if __name__ == "__main__":
     # Training settings
     parser = argparse.ArgumentParser(description='Cross Modal Retrieval for Point Cloud, Mesh, and Image Models')
     
-    parser.add_argument('--weight_crc', type=float, default=1, metavar='weight_crc', help='weight crc' ) #20 - 10   50
+    parser.add_argument('--weight_crc', type=float, default=0.2, metavar='weight_crc', help='weight crc' ) 
 
     parser.add_argument('--weight_align', type=float, default=1, metavar='weight_align', help='weight align' )
     
@@ -750,7 +791,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--n_labeled', type=int, default=400, metavar='n_labeled', help='number of labeled data in the dataset')
 
-    parser.add_argument('--batch_size', type=int, default=50, metavar='batch_size',  help='Size of batch)')
+    parser.add_argument('--batch_size', type=int, default=32, metavar='batch_size',  help='Size of batch)')
 
     parser.add_argument('--epochs', type=int, default=50, metavar='N', help='number of episode to train 100')
     
